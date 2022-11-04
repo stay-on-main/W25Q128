@@ -1,0 +1,7 @@
+[package]
+name = "w25q128"
+version = "0.1.0"
+authors = ["Zakhar Kravtsov <kravtsov.zakhar@gmail.com>"]
+
+[dependencies]
+embedded-hal = "0.2.3"
