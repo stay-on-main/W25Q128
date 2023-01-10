@@ -29,6 +29,9 @@ extern crate embedded_hal;
 use embedded_hal::blocking::spi;
 use embedded_hal::digital::v2::OutputPin;
 
+extern crate embedded_storage;
+use embedded_storage::nor_flash::{NorFlash, ReadNorFlash, ErrorType, NorFlashError, NorFlashErrorKind};
+
 /// Maximum len of write operation
 pub const PAGE_SIZE: usize = 256;
 /// Total flash size is 16 Mega Bytes
@@ -38,13 +41,13 @@ const BUSY_BIT_MASK: u8 = 0x01;
 
 /// Possible errors during interaction with flash IC.
 #[derive(Debug, Clone, Copy)]
-pub enum Error<PinError, SpiError> {
+pub enum Error {
     /// Address passed to [`EraseUnit`] doesn't aligned to block size
     BlockAddrNotAligned,
     /// GPIO error
-    Pin(PinError),
+    PinError,
     /// SPI error
-    Spi(SpiError),
+    SpiError,
 }
 
 
@@ -99,7 +102,7 @@ impl <SPI, CS, WP, RST, SpiError, PinError> Winbond25Q128<SPI, CS, WP, RST>
     /// (chip select) pin. WP (write protect) and RST (reset)
     /// pins are oprional. If you don't pass this pins to function, 
     /// make sure that they in high state.
-    pub fn new(spi: SPI, cs: CS, wp: Option<WP>, rst: Option<RST>) -> Result<Self, Error<PinError, SpiError>> {
+    pub fn new(spi: SPI, cs: CS, wp: Option<WP>, rst: Option<RST>) -> Result<Self, Error> {
         let mut flash = Self {
             spi,
             cs,
@@ -109,37 +112,25 @@ impl <SPI, CS, WP, RST, SpiError, PinError> Winbond25Q128<SPI, CS, WP, RST>
         };
 
         if let Some(ref mut wp_pin) = flash.wp {
-            wp_pin.set_high().map_err(Error::Pin)?;
+            if wp_pin.set_high().is_err() {
+                return Err(Error::PinError);
+            }
         }
 
         if let Some(ref mut reset_pin) = flash.rst {
-            reset_pin.set_high().map_err(Error::Pin)?;
+            if reset_pin.set_high().is_err() {
+                return Err(Error::PinError);
+            }
         }
 
         Ok(flash)
     }
 
-    /// Reads bytes from valid flash IC address to buffer. 
-    /// Return bytes read count. Ok(0) means, that flash IC is busy,
-    /// and you need to call this function later.  (Flash IC can
-    /// be busy after erase or write operation).
-    pub fn read(&mut self, addr: u32, buf: &mut [u8]) -> Result<usize, Error<PinError, SpiError>> {
-        // If flash is busy - we can't read at this moment.
-        // But this is't error, just need to wait.
-        if self.is_busy()? {
-            return Ok(0);
-        }
-
-        self.cmd_read(Cmd::ReadData, Some(addr), buf)
-    }
-
     /// Erasing dedicated area. Before writing, block must be erased.
     /// After erasing, busy bit set to 1. If flash is busy, when user
     /// calls this function - it will return Ok(false) in other case Ok(true). 
-    pub fn erase(&mut self, unit: EraseUnit) -> Result<bool, Error<PinError, SpiError>> {
-        if self.is_busy()? {
-            return Ok(false);
-        }
+    pub fn erase_unit(&mut self, unit: EraseUnit) -> Result<(), Error> {
+        self.wait_if_busy()?;
 
         let cmd;
         let address;
@@ -176,7 +167,7 @@ impl <SPI, CS, WP, RST, SpiError, PinError> Winbond25Q128<SPI, CS, WP, RST>
         self.cmd_write(cmd, address, None)?;
         // After erase operation, busy bit is true
         self.busy = true;
-        Ok(true)
+        Ok(())
     }
 
     /// Write bytes to valid address. Area muste be eresed with 
@@ -184,23 +175,10 @@ impl <SPI, CS, WP, RST, SpiError, PinError> Winbond25Q128<SPI, CS, WP, RST>
     /// can be writing per one call. After writing busy bit is 1.
     /// If user trying to write, when flash is busy function will 
     /// return Ok(0).
-    pub fn write(&mut self, addr: u32, buf: &[u8]) -> Result<usize, Error<PinError, SpiError>> {
-        // Unable to write when busy bit is 1, need wait
-        if self.is_busy()? {
-            return Ok(0);
-        }
-
-        self.cmd_write(Cmd::WriteEnable, None, None)?;
-        let len = core::cmp::min(buf.len(), PAGE_SIZE);
-        self.cmd_write(Cmd::PageProgram, Some(addr), Some(&buf[..len]))?;
-        // After write operation, busy bit is 1
-        self.busy = true;
-        Ok(len)
-    }
 
     /// Return current busy status. Flash IC can be busy after erase or 
     /// write operation.
-    pub fn is_busy(&mut self) -> Result<bool, Error<PinError, SpiError>> {
+    pub fn is_busy(&mut self) -> Result<bool, Error> {
         if self.busy {
             let mut reg = [0x00];
             self.cmd_read(Cmd::ReadStatusRegister1, None, &mut reg)?;
@@ -211,7 +189,7 @@ impl <SPI, CS, WP, RST, SpiError, PinError> Winbond25Q128<SPI, CS, WP, RST>
     }
 
     /// Wait while flash IC is in a busy state. Useful when working with flash in a blocking manner.
-    pub fn wait_if_busy(&mut self) -> Result<(), Error<PinError, SpiError>> {
+    pub fn wait_if_busy(&mut self) -> Result<(), Error> {
         loop {
             if self.is_busy()? == false {
                 return Ok(());
@@ -224,38 +202,62 @@ impl <SPI, CS, WP, RST, SpiError, PinError> Winbond25Q128<SPI, CS, WP, RST>
         (self.spi, self.cs, self.wp, self.rst)
     }
 
-    fn cmd_read(&mut self, cmd: Cmd, addr: Option<u32>, buf: &mut[u8]) -> Result<usize, Error<PinError, SpiError>> {
+    fn cmd_read(&mut self, cmd: Cmd, addr: Option<u32>, buf: &mut[u8]) -> Result<(), Error> {
         let cmd_buf = [cmd as u8; 1];
-        self.cs.set_low().map_err(Error::Pin)?;
-        self.spi.write(&cmd_buf).map_err(Error::Spi)?;
-
-        if let Some(addr) = addr {
-            self.spi.write(&addr_to_bytes(addr)).map_err(Error::Spi)?;
+        
+        if self.cs.set_low().is_err() {
+            return Err(Error::PinError);
+        }
+        
+        if self.spi.write(&cmd_buf).is_err() {
+            return Err(Error::SpiError);
         }
 
-        self.spi.transfer(buf).map_err(Error::Spi)?;
-        self.cs.set_high().map_err(Error::Pin)?;
-        Ok(buf.len())
+        if let Some(addr) = addr {
+            if self.spi.write(&addr_to_bytes(addr)).is_err() {
+                return Err(Error::SpiError);
+            }
+        }
+
+        if self.spi.transfer(buf).is_err() {
+            return Err(Error::SpiError);
+        }
+
+        if self.cs.set_high().is_err() {
+            return Err(Error::PinError);
+        }
+
+        Ok(())
     }
 
-    fn cmd_write(&mut self, cmd: Cmd, addr: Option<u32>, buf: Option<&[u8]>) -> Result<usize, Error<PinError, SpiError>> {
+    fn cmd_write(&mut self, cmd: Cmd, addr: Option<u32>, buf: Option<&[u8]>) -> Result<(), Error> {
         let cmd_buf = [cmd as u8; 1];
-        self.cs.set_low().map_err(Error::Pin)?;
-        self.spi.write(&cmd_buf).map_err(Error::Spi)?;
+
+        if self.cs.set_low().is_err() {
+            return Err(Error::PinError);
+        }
+
+        if self.spi.write(&cmd_buf).is_err() {
+            return Err(Error::SpiError);
+        }
         
         if let Some(addr) = addr {
-            self.spi.write(&addr_to_bytes(addr)).map_err(Error::Spi)?;
+            if self.spi.write(&addr_to_bytes(addr)).is_err() {
+                return Err(Error::SpiError);
+            }
         }
-
-        let mut len = 0;
 
         if let Some(data) = buf {
-            self.spi.write(data).map_err(Error::Spi)?;
-            len = data.len();
+            if self.spi.write(data).is_err() {
+                return Err(Error::SpiError);
+            }
         }
         
-        self.cs.set_high().map_err(Error::Pin)?;
-        Ok(len)
+        if self.cs.set_high().is_err() {
+            return Err(Error::PinError);
+        }
+
+        Ok(())
     }
 }
 
@@ -266,4 +268,85 @@ fn addr_to_bytes(addr: u32) -> [u8; 3] {
         (addr >> 8) as u8,
         addr as u8
     ]
+}
+
+
+impl NorFlashError for Error {
+    fn kind(&self) -> NorFlashErrorKind {
+        match *self {
+            Error::BlockAddrNotAligned => {
+                NorFlashErrorKind::NotAligned
+            },
+            Error::PinError | Error::SpiError => {
+                NorFlashErrorKind::Other
+            }
+        }
+    }
+}
+
+impl <SPI, CS, WP, RST, SpiError, PinError> ErrorType for Winbond25Q128<SPI, CS, WP, RST>
+    where
+        SPI: spi::Transfer<u8, Error = SpiError> + spi::Write<u8, Error = SpiError>,
+        CS: OutputPin<Error = PinError>,
+        WP: OutputPin<Error = PinError>,
+        RST: OutputPin<Error = PinError>,
+{
+    type Error = Error;
+}
+
+impl <SPI, CS, WP, RST, SpiError, PinError> ReadNorFlash for Winbond25Q128<SPI, CS, WP, RST>
+    where
+        SPI: spi::Transfer<u8, Error = SpiError> + spi::Write<u8, Error = SpiError>,
+        CS: OutputPin<Error = PinError>,
+        WP: OutputPin<Error = PinError>,
+        RST: OutputPin<Error = PinError>,
+{
+    const READ_SIZE: usize = 1;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.wait_if_busy()?;
+        self.cmd_read(Cmd::ReadData, Some(offset), bytes)
+    }
+
+    fn capacity(&self) -> usize {
+        TOTAL_SIZE
+    }
+}
+
+impl <SPI, CS, WP, RST, SpiError, PinError> NorFlash for Winbond25Q128<SPI, CS, WP, RST>
+    where
+        SPI: spi::Transfer<u8, Error = SpiError> + spi::Write<u8, Error = SpiError>,
+        CS: OutputPin<Error = PinError>,
+        WP: OutputPin<Error = PinError>,
+        RST: OutputPin<Error = PinError>,
+{
+    const ERASE_SIZE: usize = 4096;
+    const WRITE_SIZE: usize = 256;
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.wait_if_busy()?;
+        self.cmd_write(Cmd::WriteEnable, None, None)?;
+        let len = core::cmp::min(bytes.len(), PAGE_SIZE);
+        self.cmd_write(Cmd::PageProgram, Some(offset), Some(&bytes[..len]))?;
+        // After write operation, busy bit is 1
+        self.busy = true;
+        Ok(())
+    }
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        match to - from {
+            4096 => {
+                self.erase_unit(EraseUnit::Block4k(from))
+            },
+            32768 => {
+                self.erase_unit(EraseUnit::Block32k(from))
+            },
+            65536 => {
+                self.erase_unit(EraseUnit::Block64k(from))
+            },
+            _ => {
+                Err(Error::BlockAddrNotAligned)
+            }
+        }
+    }
 }

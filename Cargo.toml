@@ -5,3 +5,4 @@ authors = ["Zakhar Kravtsov <kravtsov.zakhar@gmail.com>"]
 
 [dependencies]
 embedded-hal = "0.2.3"
+embedded-storage = "0.3.0"
